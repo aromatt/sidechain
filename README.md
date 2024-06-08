@@ -20,7 +20,7 @@ alice	{"foo":0}
 You need to print a list of all users that have `"foo" > 0`. How would you do it?
 
 It's easy enough to do `cut -f2 | jq 'select(.foo > 0)'`, but this is no good because
-`cut` chops off the user names.
+`cut` removes the user names.
 
 `sidechain` makes this easy:
 
@@ -30,11 +30,25 @@ cat input.tsv \
   | cut -f1
 ```
 
+### A more realistic example
+You have millions of files names like `20231101_1.2.3.0-24.csv.gz`. The `1.2.3.0-24`
+part represents a CIDR (`1.2.3.0/24`). You're interested in a particular set of
+CIDRs, but they might be child/parent CIDRs of those in the filenames.
+
+You have a tool that can efficiently filter a list of input CIDRs given a set of
+query CIDRs, but you'd need to remove the date prefixes and `.csv` suffixes in order
+to use it. This is a problem; you won't be able to reconstruct the full filenames
+without the date prefixes.
+
+```bash
+ls /path/to/files/ | sidechain filter 'sed <extract CIDR> | filter-cidrs'
+```
+
 ### Improving performance with `-t`
 When you specify `-t <char>`, you agree to make your filter print exactly one line
 per input line. Print `<char>` to indicate that the input line passed the filter.
 
-Here's the above example again using `-t`:
+Here's the first example again using `-t`:
 
 ```bash
 cat input.tsv \
