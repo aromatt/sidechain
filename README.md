@@ -6,18 +6,22 @@ Split and merge Unix pipelines for filtering and data manipulation.
 
 The name and concept are borrowed from an audio production technique in which an
 effect on one audio signal is controlled by another audio signal. For example, you
-might run a bass guitar through a compressor triggered by a kick drum.
+might run a bass guitar signal through a compressor triggered by a kick drum signal.
 
 Similarly, in a Unix pipeline, we can use `sidechain` to control our critical path
-using a secondary data stream.
+using a "side" command.
 
 ## Filter Mode
-Imagine you have TSV data like this:
+Filter mode allows you to use a line-mangling filter while preserving the original,
+unaltered input lines.
+
+### Example
+Imagine we have TSV data like this:
 ```txt
 bob	{"foo":1}
 alice	{"foo":0}
 ```
-You need to print a list of all users that have `"foo" > 0`. How would you do it?
+We want to print a list of all users that have `"foo" > 0`. How would you do it?
 
 It's easy enough to do `cut -f2 | jq 'select(.foo > 0)'`, but this is no good because
 `cut` removes the user names.
@@ -30,58 +34,126 @@ cat input.tsv \
   | cut -f1
 ```
 
-### A more realistic example
-You have millions of files names like `20231101_1.2.3.0-24.csv.gz`. The `1.2.3.0-24`
-part represents a CIDR (`1.2.3.0/24`). You're interested in a particular set of
-CIDRs, but they might be child/parent CIDRs of those in the filenames.
+Our side command, `cut -f2 | jq "select(.foo > 0)"`, is used as a filter. Lines that
+pass the filter are then passed to the final output process, `cut -f1`.
 
-You have a tool that can efficiently filter a list of input CIDRs given a set of
-query CIDRs, but you'd need to remove the date prefixes and `.csv` suffixes in order
-to use it. This is a problem; you won't be able to reconstruct the full filenames
-without the date prefixes.
+### A more realistic example
+You have millions of files with names like `20231101_1.2.3.0-24.csv.gz`. The
+`1.2.3.0-24` part represents an IP network (`1.2.3.0/24`). You're interested in a
+particular set of networks, but these might be child/parent networks of those in the
+filenames.
+
+You have a tool called `filter-nets` that can efficiently filter a list of input
+networks given a set of query networks. But in order to use it, you'd need to remove
+the date prefixes and `.csv` suffixes. This is a problem: you won't be able to
+reconstruct the full filenames without those date prefixes.
 
 ```bash
-ls /path/to/files/ | sidechain filter 'sed <extract CIDR> | filter-cidrs'
+ls /path/to/files/ | sidechain filter 'sed <extract network> | filter-nets'
 ```
 
-### Improving performance with `-t`
-When you specify `-t <char>`, you agree to make your filter print exactly one line
-per input line. Print `<char>` to indicate that the input line passed the filter.
+### Improving performance with a 1-to-1 filter
+Normally, a filter introduces ambiguity: the number of output lines will be less than
+or equal to the number of input lines, and there is no foolproof way to match up
+input with output, because the filter may modify each line (if it doesn't, then you
+don't need to use `sidechain`!).
 
-Here's the first example again using `-t`:
+By default, `sidechain` uses a dynamic batching technique to solve this problem,
+typically requiring multiple invocations of the filter command. This makes throughput
+highly dependent on the input data.
+
+To optimize performance, you can make your filter 1-to-1, meaning it will output
+exactly one line per input line.
+
+To declare this commitment, use `-t <char>`. Then, make sure your filter prints
+exactly one line per input line; print `<char>` to indicate that a line has passed
+the filter.
+
+Here's the first example again, using `-t`:
 
 ```bash
 cat input.tsv \
-  | sidechain filter -t1 'cut -f2 | jq "if .foo > 0 then 1 else 0 end"' \
+  | sidechain filter -t 1 'cut -f2 | jq "if .foo > 0 then 1 else 0 end"' \
   | cut -f1
 ```
 
-This provides a valuable hint to `sidechain`: no extra work is required to correctly
-pair your filter's output lines with its input lines.
-
 ## Map Mode
-Suppose you have a file containing lines of JSON with an `"ip"` field, but some of
-the "IPs" are actually URLs. You want to clean up this data. You have a tool called
-`extract-ips` which can perform the IP extraction
-([cidrq](https://github.com/aromatt/cidrq) can actually do this!).
+In map mode, your side command generates values (one per line) which are inserted
+into lines of output.
+
+We can use `-I` (like `xargs`) to define a placeholder character for our generated
+values:
 
 ```bash
-cat input.json | sidechain map -I% 'jq .ip | extract-ips' jq '.ip = "%"'
+sidechain map -I% SIDE_COMMAND MAIN_COMMAND
 ```
 
-Note: this does NOT invoke `jq` for every input line. Each use of `jq` in the above
-command is invoked only once, processing all of your input before exiting.
+Note: unlike filter mode, map mode introduces no ambiguity, so `sidechain` invokes
+`SIDE_COMMAND` and `MAIN_COMMAND` exactly once each, processing all lines before
+exiting.
+
+### Example
+Suppose you have a file containing lines of JSON with an `"ip"` field, but some of
+the "IPs" are actually URLs. You want to clean up this data. It's not too difficult
+to extract the host from a URL, but how would you do it surgically within JSON?
+
+`sidechain map` makes this simple.
+
+For clarity, let's say you're using a tool called `host-from-url` to convert the URLs
+to IPs.
+
+```bash
+cat input.json | sidechain map -I% 'jq .ip | host-from-url' jq '.ip = "%"'
+```
 
 ### Using `$[]` for process substitution
-For a cleaner, more-intuitive incantation, you can use `$[]` to wrap your
-value-generating command:
+For a cleaner, more-intuitive incantation, you can use `$[]` to wrap your side
+command:
 
 ```bash
-cat input.json | sidechain map jq '.ip = "$[jq .ip | extract-ips]"'
+cat input.json | sidechain map jq '.ip = "$[jq .ip | host-from-url]"'
 ```
+
+To reiterate: neither the main command nor the `$[]`-wrapped side command is invoked
+more than once; all lines are processed using a single invocation.
 
 ### Mapping from a file
 Alternatively, you can provide a file containing the values that you want to insert:
 ```bash
 cat input.json | sidechain map -I% -f ips.txt jq '.ip = "%"'
 ```
+
+Or, using `$[]`:
+```bash
+cat input.json | sidechain map '.ip = "$[cat ips.txt]"'
+```
+
+## Flatmap Mode
+Flatmap mode is similar to map mode, but the side command can generate *multiple
+values* per input line.
+
+### Example
+Consider a file with this format:
+```txt
+1.2.3.4	{"users":[{"name":"foo"},{"name":"bar"}]}
+```
+
+You want to flatten it into:
+```txt
+1.2.3.4	{"name":"foo"}
+1.2.3.4 {"name":"bar"}
+```
+
+We can use flatmap mode:
+
+```bash
+cat input.tsv | sidechain flatmap -I% 'jq -c ".users[]"' awk '{print $1 "\t" "%"}'
+```
+
+`$[]` works too:
+```bash
+cat input.tsv | sidechain flatmap awk '{print $1 "\t" "$[cut -f2 | jq -c \".users[]\"]"}'
+```
+
+Note: because of the ambuity problem, flatmap mode invokes the side command
+separately for each input line.
